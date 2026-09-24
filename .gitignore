@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+
+# Environment Variables & Secrets
+.env
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local indices and temporary data caches (preserve folder structure with .gitkeep)
+data/indices/*
+!data/indices/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Additional env files
+.env.local
+.env.*.local
+
+# Runtime artifacts
+results/
+*.log
+
+# Frontend build output (already covered by `dist/` but explicit is safer)
+frontend/dist/
+
+# User data (verify before committing)
+data/conversations.json
+data/leads.json
