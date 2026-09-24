@@ -229,7 +229,8 @@ class RAGPipeline:
             llm=LLMProvider(
                 provider=llm_cfg.get("provider", "mock"),
                 model_name=llm_cfg.get("model_name", "gemini-flash-lite-latest"),
-                temperature=llm_cfg.get("temperature", 0.1)
+                temperature=llm_cfg.get("temperature", 0.1),
+                timeout_seconds=llm_cfg.get("timeout_seconds", 10)
             ),
             embedder=self.embedder
         )

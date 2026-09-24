@@ -1,5 +1,7 @@
 # 🧠 Enterprise Agentic Retrieval-Augmented Generation (Agentic RAG)
 
+## Deployment — see docs/DEPLOY.md
+
 A production-grade, secure, and observable **Agentic RAG Platform** designed for enterprise knowledge synthesis. Combines hybrid dense/sparse retrieval with an autonomous decision routing layer, Google Drive workspace connectors, safe AST mathematical calculation, authoritative web search fallback, observable evidence gating, and strict Pydantic structured output contracts.
 
 ---

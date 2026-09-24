@@ -1,14 +1,40 @@
+# Environments & secrets
 venv/
 .venv/
-frontend/node_modules/
-frontend/dist/
+.env
+.env.*
+
+# VCS, editors, Docker files
 .git/
 .gitignore
+.vscode/
+.idea/
+.claude/
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
 htmlcov/
+.ipynb_checkpoints/
+*.log
+
+# Not needed at runtime
+tests/
 results/
 notebooks/
-.env
+
+# Frontend: ship only the prebuilt dist/
+frontend/*
+!frontend/dist/
+
+# Runtime user data (PII) — never bake into the image; data/indices/ is kept
+data/leads.json
+data/conversations.json
+data/app.db*
+
+# evaluation/ is intentionally NOT excluded: app.py imports evaluation.run_eval at startup

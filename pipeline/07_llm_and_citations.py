@@ -263,12 +263,18 @@ class LLMProvider:
     - Offline Enterprise Grounded Generator
     """
 
-    def __init__(self, provider: str = "mock", model_name: str = "gemini-flash-lite-latest", temperature: float = 0.1):
+    # Gemini models that recently returned 404 (retired) or 429 (quota), mapped to the time they may be retried
+    _gemini_cooldown: Dict[str, float] = {}
+
+    def __init__(self, provider: str = "mock", model_name: str = "gemini-flash-lite-latest", temperature: float = 0.1,
+                 timeout_seconds: float = 10.0):
         self.provider = provider.lower()
         self.model_name = model_name
         self.temperature = temperature
+        self.timeout_seconds = timeout_seconds
 
-    def _gemini_generate_content(self, model_endpoint: str, api_key: str, prompt: str, system_prompt: str) -> Optional[str]:
+    def _gemini_generate_content(self, model_endpoint: str, api_key: str, prompt: str, system_prompt: str,
+                                 timeout: float = 15) -> Optional[str]:
         """Call a single Gemini model endpoint; return answer text or None on failure."""
         import urllib.request
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_endpoint}:generateContent?key={api_key}"
@@ -284,7 +290,7 @@ class LLMProvider:
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
             candidates = data.get("candidates", [])
             if candidates and "content" in candidates[0] and "parts" in candidates[0]["content"]:
@@ -302,42 +308,63 @@ class LLMProvider:
                 logger.info("GEMINI_API_KEY not found in environment. Using deterministic Grounded Generator.")
                 return self._mock_generate(prompt)
 
-            # Google retires model names (a retired name returns HTTP 404). Try the
-            # configured model, then known flash models, then discover live models.
+            import urllib.error
+            import urllib.request
+
+            # All attempts share one time budget so a slow or overloaded API cannot stall a query.
+            deadline = time.monotonic() + self.timeout_seconds
+            cooldown = LLMProvider._gemini_cooldown
+            saw_retired = False
+
+            def attempt(model_endpoint: str, max_wait: Optional[float] = None) -> Optional[str]:
+                nonlocal saw_retired
+                remaining = deadline - time.monotonic()
+                if remaining < 1 or cooldown.get(model_endpoint, 0) > time.time():
+                    return None
+                try:
+                    return self._gemini_generate_content(model_endpoint, api_key, prompt, system_prompt,
+                                                         timeout=min(remaining, max_wait or remaining))
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        saw_retired = True
+                        cooldown[model_endpoint] = time.time() + 86400
+                    elif e.code == 429:
+                        cooldown[model_endpoint] = time.time() + 60
+                    logger.warning(f"Gemini model '{model_endpoint}' failed: {e}")
+                except Exception as e:
+                    logger.warning(f"Gemini model '{model_endpoint}' failed: {e}")
+                return None
+
+            # Configured model first; gemini-3-flash-preview is a backup (free tier allows only 20 requests/day).
             model_list = []
             for m in [self.model_name, "gemini-3-flash-preview"]:
                 if m and m not in model_list:
                     model_list.append(m)
 
-            for model_endpoint in model_list:
-                try:
-                    text = self._gemini_generate_content(model_endpoint, api_key, prompt, system_prompt)
-                    if text:
-                        return text
-                except Exception as e:
-                    logger.warning(f"Gemini model '{model_endpoint}' failed: {e}")
+            # The primary gets 60% of the budget so a hang still leaves time for the backup
+            for i, model_endpoint in enumerate(model_list):
+                text = attempt(model_endpoint, max_wait=self.timeout_seconds * 0.6 if i == 0 else None)
+                if text:
+                    return text
 
-            # Last resort: ask the API which models currently exist and try each flash model
-            try:
-                import urllib.request
-                list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-                req = urllib.request.Request(list_url, headers={"User-Agent": "AgenticRAG/2.0"})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    models_data = json.loads(r.read().decode("utf-8"))
-                available = [m.get("name", "").replace("models/", "") for m in models_data.get("models", [])]
-                flash_models = [m for m in available if "flash" in m]
-                for model_endpoint in flash_models:
-                    if model_endpoint in model_list:
-                        continue
-                    try:
-                        text = self._gemini_generate_content(model_endpoint, api_key, prompt, system_prompt)
+            # Google retires model names (HTTP 404). Only then look up live flash models, trying at most 3.
+            if saw_retired and deadline - time.monotonic() >= 1:
+                try:
+                    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+                    req = urllib.request.Request(list_url, headers={"User-Agent": "AgenticRAG/2.0"})
+                    with urllib.request.urlopen(req, timeout=max(1, min(5, deadline - time.monotonic()))) as r:
+                        models_data = json.loads(r.read().decode("utf-8"))
+                    available = [m.get("name", "").replace("models/", "") for m in models_data.get("models", [])]
+                    flash_models = [m for m in available
+                                    if "flash" in m and m not in model_list
+                                    and not any(t in m for t in ("tts", "image", "audio", "live"))]
+                    for model_endpoint in flash_models[:3]:
+                        text = attempt(model_endpoint)
                         if text:
                             logger.info(f"Resolved working Gemini model: {model_endpoint}")
                             return text
-                    except Exception as e:
-                        logger.warning(f"Gemini model '{model_endpoint}' failed: {e}")
-            except Exception as e:
-                logger.warning(f"Could not discover Gemini models: {e}")
+                except Exception as e:
+                    logger.warning(f"Could not discover Gemini models: {e}")
 
             logger.warning("Gemini generation failed for all candidate models. Falling back to Grounded Generator.")
             return self._mock_generate(prompt)

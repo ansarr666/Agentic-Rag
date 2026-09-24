@@ -47,6 +47,7 @@ models:
     model_name: "gemini-flash-lite-latest"  # Google AI Studio free tier model
     temperature: 0.1
     max_tokens: 1024
+    timeout_seconds: 10                # Total LLM time budget per call; on expiry the Grounded Generator answers
 
 retrieval:
   top_k_vector: 10                   # Top candidates from vector search

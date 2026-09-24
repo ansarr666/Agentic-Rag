@@ -9,7 +9,12 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone
 from threading import Lock
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, g, has_request_context
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.exceptions import HTTPException
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 # Setup project root and ensure UTF-8 encoding on Windows
@@ -26,17 +31,110 @@ from config import load_config
 from pipeline import RAGPipeline, IngestionPipeline
 from evaluation.run_eval import run_decision_evaluation
 
-# ── Logging ──────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+# ── Logging (one JSON object per line on stdout) ─────────
+class JsonFormatter(logging.Formatter):
+    """Adds request_id/endpoint inside a request, plus any method/status/latency_ms passed via extra."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if has_request_context():
+            entry["request_id"] = g.get("request_id")
+            entry["endpoint"] = request.path
+        for key in ("method", "status", "latency_ms"):
+            if hasattr(record, key):
+                entry[key] = getattr(record, key)
+        if record.exc_info:
+            entry["traceback"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False, default=str)
+
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(JsonFormatter())
+# force=True: modules imported above may already have configured the root logger
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler], force=True)
 logger = logging.getLogger(__name__)
 
 # ── Flask App ────────────────────────────────────────────
 app = Flask(__name__, static_folder="frontend/dist", static_url_path="")
+START_TIME = time.monotonic()
 
 # ── Load RAG Pipeline (once at startup) ──────────────────
 config = load_config()
 rag = RAGPipeline(config, project_root=PROJECT_ROOT)
 logger.info("Agentic RAG Pipeline initialized and ready for queries.")
+
+# ── Production hardening (env is read after load_config(), which loads .env) ──
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.getenv("FLASK_ENV", "production"),
+        release=os.getenv("APP_VERSION", "1.0.0"),
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0")),
+        send_default_pii=False,
+    )
+    logger.info("Sentry error reporting enabled.")
+
+# Behind a load balancer, trust X-Forwarded-For from this many proxies so limits see real client IPs
+TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
+if TRUSTED_PROXY_COUNT:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=TRUSTED_PROXY_COUNT, x_proto=TRUSTED_PROXY_COUNT)
+
+# CORS: only the listed origins; with none set, no CORS headers are sent (same-origin only)
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if ALLOWED_ORIGINS:
+    CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+
+
+@app.before_request
+def _start_request():
+    g.request_id = (request.headers.get("X-Request-ID") or uuid.uuid4().hex)[:64]
+    g.start_time = time.perf_counter()
+
+
+@app.after_request
+def _log_request(response):
+    response.headers["X-Request-ID"] = g.get("request_id", "")
+    if request.path.startswith("/api/") and request.path != "/api/health":
+        latency_ms = round((time.perf_counter() - g.get("start_time", time.perf_counter())) * 1000, 2)
+        logger.info("request", extra={"method": request.method, "status": response.status_code, "latency_ms": latency_ms})
+    return response
+
+
+# Rate limits apply to /api/* only (pages, assets and the health check are never limited).
+# memory:// counts per gunicorn worker; set RATE_LIMIT_STORAGE_URI=redis://... to share counts.
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[os.getenv("RATE_LIMIT_DEFAULT", "100/hour")],
+    default_limits_exempt_when=lambda: not request.path.startswith("/api/") or request.path == "/api/health",
+    storage_uri=os.getenv("RATE_LIMIT_STORAGE_URI", "memory://"),
+    headers_enabled=True,
+)
+
+
+@app.errorhandler(429)
+def _rate_limited(e):
+    return jsonify({"error": "Too many requests. Please slow down and try again shortly.",
+                    "limit": str(e.description)}), 429
+
+
+@app.errorhandler(Exception)
+def _unhandled_error(e):
+    if isinstance(e, HTTPException):
+        return e
+    logger.exception("Unhandled server error")
+    return _server_error()
+
+
+def _server_error():
+    """Generic 500 body: details stay in the logs, the client gets a request_id to quote."""
+    return jsonify({"error": "Internal server error.", "request_id": g.get("request_id")}), 500
 
 # ── API Key Security ─────────────────────────────────────
 RAG_API_KEY = os.getenv("RAG_API_KEY", "").strip()
@@ -435,13 +533,15 @@ def admin_leads():
         return jsonify({"leads": []})
     try:
         return jsonify({"leads": json.loads(leads_path.read_text(encoding="utf-8"))})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("Reading leads failed")
+        return _server_error()
 
 
 # ── Core Agentic Query Endpoint ──────────────────────────
 
 @app.route("/api/query", methods=["POST"])
+@limiter.limit(os.getenv("RATE_LIMIT_QUERY", "20/minute"))
 def api_query():
     """
     Handle a user query with agentic routing, evidence gating,
@@ -466,7 +566,7 @@ def api_query():
         return jsonify(response.model_dump())
     except Exception as e:
         logger.error(f"Query execution failed: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return _server_error()
 
 
 # ── Document Upload & Ingestion Endpoint ────────────────
@@ -505,7 +605,7 @@ def upload_document():
         summary = pipeline.run()
     except Exception as e:
         logger.error(f"Ingestion after upload failed: {e}", exc_info=True)
-        return jsonify({"error": f"File saved but indexing failed: {e}"}), 500
+        return jsonify({"error": "File saved but indexing failed.", "request_id": g.get("request_id")}), 500
 
     global rag
     rag = RAGPipeline(config, project_root=PROJECT_ROOT)
@@ -571,8 +671,9 @@ def gdrive_sync():
         summary = rag.google_drive.sync_now()
         from dataclasses import asdict
         return jsonify(asdict(summary))
-    except Exception as e:
-        return jsonify({"error": str(e), "status": "Failed"}), 500
+    except Exception:
+        logger.exception("Google Drive sync failed")
+        return jsonify({"error": "Internal server error.", "status": "Failed", "request_id": g.get("request_id")}), 500
 
 
 # ── Agents & Tools Hub Endpoints ─────────────────────────
@@ -609,7 +710,7 @@ def run_eval():
         return jsonify(report)
     except Exception as e:
         logger.error(f"Evaluation failed: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return _server_error()
 
 
 @app.route("/api/evaluations/latest", methods=["GET"])
@@ -622,8 +723,9 @@ def get_latest_eval():
         try:
             with open(report_path, "r", encoding="utf-8") as f:
                 return jsonify(json.load(f))
-        except Exception as e:
-            return jsonify({"error": f"Error reading report: {e}"}), 500
+        except Exception:
+            logger.exception("Reading evaluation report failed")
+            return _server_error()
 
     # If decision_benchmark doesn't exist yet, run it
     report = run_decision_evaluation()
@@ -676,6 +778,8 @@ def auth_status():
 def health():
     return jsonify({
         "status": "ok",
+        "version": os.getenv("APP_VERSION", "1.0.0"),
+        "uptime_s": int(time.monotonic() - START_TIME),
         "provider": config.get("models", {}).get("llm", {}).get("provider", "unknown"),
         "google_drive_connected": rag.google_drive.state.get("connected", False),
         "api_key_secured": bool(RAG_API_KEY)
